@@ -1,0 +1,10 @@
+# Claude Code settings
+.claude/
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+
+# Temp files
+*.tmp

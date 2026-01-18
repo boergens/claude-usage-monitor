@@ -1,0 +1,8 @@
+{
+  "name": "Claude Usage Monitor",
+  "description": "Displays Claude Code session and weekly usage in the top panel",
+  "uuid": "claude-usage@local",
+  "shell-version": ["42", "43", "44", "45", "46", "47"],
+  "version": 1,
+  "url": ""
+}
