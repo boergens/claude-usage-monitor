@@ -59,6 +59,9 @@ class ClaudeUsageApp(rumps.App):
         self.last_updated_item = rumps.MenuItem("Last updated: Never", callback=None)
         self.last_updated_item.set_callback(None)
 
+        self.debug_item = rumps.MenuItem("Debug: --", callback=None)
+        self.debug_item.set_callback(None)
+
         self.menu = [
             self.account_item,
             None,  # Separator
@@ -70,6 +73,7 @@ class ClaudeUsageApp(rumps.App):
             self.weekly_resets_item,
             None,  # Separator
             self.last_updated_item,
+            self.debug_item,
             None,  # Separator
             rumps.MenuItem("Refresh Now", callback=self.refresh_clicked),
             None,  # Separator
@@ -92,166 +96,64 @@ class ClaudeUsageApp(rumps.App):
         threading.Thread(target=self.fetch_usage, daemon=True).start()
 
     def fetch_usage(self):
-        """Fetch Claude usage via tmux automation."""
+        """Fetch Claude usage by calling fetch_usage.sh script."""
         # Show loading state
         self.title = "🤖 ⟳"
-
-        session_name = f"claude_usage_fetch_{os.getpid()}"
-
-        try:
-            # Kill any existing session
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
-                capture_output=True,
-                timeout=5
-            )
-        except Exception:
-            pass
+        self.debug_item.title = "Debug: Fetching..."
 
         try:
-            # Start claude in tmux
-            subprocess.run(
-                ["tmux", "new-session", "-d", "-s", session_name, "-x", "120", "-y", "50",
-                 "claude", "--dangerously-skip-permissions"],
-                check=True,
-                timeout=10
-            )
+            # Call the fetch_usage.sh script directly
+            script_path = SCRIPT_DIR / "fetch_usage.sh"
 
-            # Wait for startup
-            time.sleep(2)
-
-            # Press enter for trust dialog
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], timeout=5)
-            time.sleep(2)
-
-            # Press enter again
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], timeout=5)
-            time.sleep(2)
-
-            # Type /usage character by character
-            for char in "/usage":
-                subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", char], timeout=5)
-                time.sleep(0.2)
-
-            # Press Enter
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], timeout=5)
-            time.sleep(2)
-
-            # Capture usage output
             result = subprocess.run(
-                ["tmux", "capture-pane", "-t", session_name, "-p"],
+                ["bash", str(script_path)],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=90,
+                cwd=str(SCRIPT_DIR)
             )
-            output = result.stdout
 
-            # Navigate left twice to get account info
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Left"], timeout=5)
-            time.sleep(0.5)
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Left"], timeout=5)
-            time.sleep(1)
+            if result.returncode != 0:
+                self.debug_item.title = f"Debug: Script error - {result.stderr[:50]}"
+                self.set_error("Script error")
+                return
 
-            # Capture account info
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", session_name, "-p"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            account_output = result.stdout
+            # Parse the key=value output from the script
+            self.parse_script_output(result.stdout)
 
-            # Clean up tmux session
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Escape"], timeout=5)
-            time.sleep(0.5)
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "/exit", "Enter"], timeout=5)
-            time.sleep(1)
-            subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
-
-            # Parse the output
-            self.parse_usage(output, account_output)
-
+        except subprocess.TimeoutExpired:
+            self.debug_item.title = "Debug: Timeout (90s)"
+            self.set_error("Timeout")
         except Exception as e:
-            print(f"Error fetching usage: {e}")
+            self.debug_item.title = f"Debug: {str(e)[:50]}"
             self.set_error("Error")
-            # Try to clean up
-            try:
-                subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
-            except Exception:
-                pass
 
-    def parse_usage(self, output, account_output=""):
-        """Parse Claude usage output and update UI."""
+    def parse_script_output(self, output):
+        """Parse key=value output from fetch_usage.sh and update UI."""
         try:
-            # Find account email from account output
-            account_match = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", account_output)
-            account_email = account_match.group(1) if account_match else None
+            # Parse key=value lines
+            data = {}
+            for line in output.strip().split('\n'):
+                if '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    data[key.strip()] = value.strip()
 
-            # Find plan type
-            plan_match = re.search(r"(Max|Pro|Team|Enterprise|Free)", account_output, re.IGNORECASE)
-            plan_type = plan_match.group(1) if plan_match else None
+            # Extract values
+            account_email = data.get('ACCOUNT_EMAIL')
+            plan_type = data.get('PLAN_TYPE')
+            session_remaining = data.get('SESSION_REMAINING', '??')
+            weekly_remaining = data.get('WEEKLY_REMAINING', '??')
+            extra_pct = data.get('EXTRA_USED')
+            time_remaining_str = data.get('TIME_REMAINING_STR')
+            confidence = data.get('CONFIDENCE')
+            session_resets = data.get('SESSION_RESETS')
+            weekly_resets = data.get('WEEKLY_RESETS')
 
-            # Find session usage
-            session_match = re.search(r"Current session.*?(\d+)%\s*used", output, re.DOTALL)
-            session_pct = session_match.group(1) if session_match else None
+            # Update debug
+            self.debug_item.title = f"Debug: OK ({len(data)} values)"
 
-            # Find weekly usage (all models)
-            weekly_match = re.search(r"Current week \(all models\).*?(\d+)%\s*used", output, re.DOTALL)
-            weekly_pct = weekly_match.group(1) if weekly_match else None
-
-            # Find extra usage
-            extra_match = re.search(r"Extra usage.*?(\d+)%\s*used", output, re.DOTALL)
-            extra_pct = extra_match.group(1) if extra_match else None
-
-            # Find reset times
-            session_reset_match = re.search(r"(?:session|limit).*?(?:resets?|refreshes?).*?(?:in\s+)?(\d+[hm](?:\s*\d+[hm])?|\d{1,2}:\d{2}(?:\s*[AP]M)?)", output, re.IGNORECASE)
-            session_resets = session_reset_match.group(1) if session_reset_match else None
-
-            weekly_reset_match = re.search(r"(?:week|weekly).*?(?:resets?|refreshes?).*?(?:in\s+)?(\d+[dhm](?:\s*\d+[hm])?|\w+day|\d{1,2}:\d{2})", output, re.IGNORECASE)
-            weekly_resets = weekly_reset_match.group(1) if weekly_reset_match else None
-
-            # Calculate remaining
-            session_used = int(session_pct) if session_pct else None
-            session_remaining = 100 - session_used if session_used is not None else "??"
-
-            weekly_used = int(weekly_pct) if weekly_pct else None
-            weekly_remaining = 100 - weekly_used if weekly_used is not None else "??"
-
-            # Try to get predictions from neural process
-            time_remaining_str = None
-            confidence = None
-
-            if session_used is not None:
-                try:
-                    from neural_process import UsagePredictor
-                    predictor = UsagePredictor()
-
-                    # Record observation for future training
-                    if weekly_used is not None:
-                        predictor.record_observation(
-                            session_used, weekly_used,
-                            session_resets=session_resets,
-                            weekly_resets=weekly_resets
-                        )
-
-                    # Get prediction
-                    result = predictor.predict_depletion(session_used)
-                    time_remaining = result["time_remaining_hours_mean"]
-                    confidence = result["confidence"]
-
-                    # Format time remaining
-                    if time_remaining <= 0:
-                        time_remaining_str = "<5m"
-                    elif time_remaining >= 1:
-                        time_remaining_str = f"{time_remaining:.1f}h"
-                    else:
-                        time_remaining_str = f"{int(time_remaining * 60)}m"
-
-                except Exception as e:
-                    print(f"Prediction error: {e}")
-
-            # Update UI (must be done on main thread via rumps)
-            if time_remaining_str:
+            # Update UI
+            if time_remaining_str and time_remaining_str != '??':
                 self.title = f"🤖 {time_remaining_str} ({session_remaining}%)"
             else:
                 self.title = f"🤖 W:{weekly_remaining}% S:{session_remaining}%"
@@ -267,11 +169,14 @@ class ClaudeUsageApp(rumps.App):
 
             self.session_item.title = f"Session remaining: {session_remaining}%"
 
-            if time_remaining_str:
+            if time_remaining_str and time_remaining_str != '??':
                 time_text = f"Depletes in ~{time_remaining_str}"
                 if confidence:
-                    conf = round(confidence * 100)
-                    time_text += f" ({conf}% conf)"
+                    try:
+                        conf = round(float(confidence) * 100)
+                        time_text += f" ({conf}% conf)"
+                    except:
+                        pass
                 self.time_remaining_item.title = time_text
             else:
                 self.time_remaining_item.title = "Depletes: --"
@@ -297,7 +202,7 @@ class ClaudeUsageApp(rumps.App):
             self.last_updated_item.title = f"Last updated: {datetime.now().strftime('%H:%M:%S')}"
 
         except Exception as e:
-            print(f"Error parsing usage: {e}")
+            self.debug_item.title = f"Debug: Parse error - {str(e)[:30]}"
             self.set_error("Parse error")
 
     def set_error(self, msg):
