@@ -57,6 +57,8 @@ def create_icon_image(text="🤖", bg_color="#4A90D9"):
 
 class ClaudeUsageTray:
     def __init__(self):
+        self.account_email = None
+        self.plan_type = None
         self.session_remaining = "??"
         self.weekly_remaining = "??"
         self.time_remaining_str = None
@@ -76,8 +78,22 @@ class ClaudeUsageTray:
         self.refresh_thread = threading.Thread(target=self.refresh_loop, daemon=True)
         self.refresh_thread.start()
 
+    def get_account_text(self):
+        if self.account_email:
+            text = f"Account: {self.account_email}"
+            if self.plan_type:
+                text += f" ({self.plan_type})"
+            return text
+        return "Account: --"
+
     def create_menu(self):
         return pystray.Menu(
+            pystray.MenuItem(
+                lambda item: self.get_account_text(),
+                None,
+                enabled=False
+            ),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 lambda item: f"Session: {self.session_remaining}% remaining",
                 None,
@@ -226,6 +242,8 @@ class ClaudeUsageTray:
                     key, value = line.split('=', 1)
                     data[key.strip()] = value.strip()
 
+            self.account_email = data.get('ACCOUNT_EMAIL')
+            self.plan_type = data.get('PLAN_TYPE')
             self.session_remaining = data.get('SESSION_REMAINING', '??')
             self.weekly_remaining = data.get('WEEKLY_REMAINING', '??')
             self.time_remaining_str = data.get('TIME_REMAINING_STR')

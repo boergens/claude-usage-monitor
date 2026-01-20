@@ -38,6 +38,9 @@ class ClaudeUsageApp(rumps.App):
         )
 
         # Menu items
+        self.account_item = rumps.MenuItem("Account: --", callback=None)
+        self.account_item.set_callback(None)
+
         self.session_item = rumps.MenuItem("Session: Loading...", callback=None)
         self.session_item.set_callback(None)
 
@@ -51,6 +54,8 @@ class ClaudeUsageApp(rumps.App):
         self.last_updated_item.set_callback(None)
 
         self.menu = [
+            self.account_item,
+            None,  # Separator
             self.session_item,
             self.time_remaining_item,
             None,  # Separator
@@ -124,7 +129,7 @@ class ClaudeUsageApp(rumps.App):
             subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], timeout=5)
             time.sleep(2)
 
-            # Capture output
+            # Capture usage output
             result = subprocess.run(
                 ["tmux", "capture-pane", "-t", session_name, "-p"],
                 capture_output=True,
@@ -132,6 +137,21 @@ class ClaudeUsageApp(rumps.App):
                 timeout=10
             )
             output = result.stdout
+
+            # Navigate left twice to get account info
+            subprocess.run(["tmux", "send-keys", "-t", session_name, "Left"], timeout=5)
+            time.sleep(0.5)
+            subprocess.run(["tmux", "send-keys", "-t", session_name, "Left"], timeout=5)
+            time.sleep(1)
+
+            # Capture account info
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", session_name, "-p"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            account_output = result.stdout
 
             # Clean up tmux session
             subprocess.run(["tmux", "send-keys", "-t", session_name, "Escape"], timeout=5)
@@ -141,7 +161,7 @@ class ClaudeUsageApp(rumps.App):
             subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
 
             # Parse the output
-            self.parse_usage(output)
+            self.parse_usage(output, account_output)
 
         except Exception as e:
             print(f"Error fetching usage: {e}")
@@ -152,9 +172,17 @@ class ClaudeUsageApp(rumps.App):
             except Exception:
                 pass
 
-    def parse_usage(self, output):
+    def parse_usage(self, output, account_output=""):
         """Parse Claude usage output and update UI."""
         try:
+            # Find account email from account output
+            account_match = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", account_output)
+            account_email = account_match.group(1) if account_match else None
+
+            # Find plan type
+            plan_match = re.search(r"(Max|Pro|Team|Enterprise|Free)", account_output, re.IGNORECASE)
+            plan_type = plan_match.group(1) if plan_match else None
+
             # Find session usage
             session_match = re.search(r"Current session.*?(\d+)%\s*used", output, re.DOTALL)
             session_pct = session_match.group(1) if session_match else None
@@ -208,6 +236,15 @@ class ClaudeUsageApp(rumps.App):
                 self.title = f"🤖 {time_remaining_str} ({session_remaining}%)"
             else:
                 self.title = f"🤖 W:{weekly_remaining}% S:{session_remaining}%"
+
+            # Update account info
+            if account_email:
+                account_text = f"Account: {account_email}"
+                if plan_type:
+                    account_text += f" ({plan_type})"
+                self.account_item.title = account_text
+            else:
+                self.account_item.title = "Account: --"
 
             self.session_item.title = f"Session remaining: {session_remaining}%"
 

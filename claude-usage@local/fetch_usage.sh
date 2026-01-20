@@ -32,8 +32,17 @@ tmux send-keys -t "$SESSION_NAME" Enter
 # Wait for output to render
 sleep 2
 
-# Capture the pane content
+# Capture the pane content (usage info)
 OUTPUT=$(tmux capture-pane -t "$SESSION_NAME" -p)
+
+# Navigate left twice to get account info
+tmux send-keys -t "$SESSION_NAME" Left
+sleep 0.5
+tmux send-keys -t "$SESSION_NAME" Left
+sleep 1
+
+# Capture the account info
+ACCOUNT_OUTPUT=$(tmux capture-pane -t "$SESSION_NAME" -p)
 
 # Kill the session
 tmux send-keys -t "$SESSION_NAME" Escape
@@ -53,7 +62,8 @@ if [ -x "/Users/kevin/Documents/newstart/venv/bin/python" ]; then
 fi
 
 # Parse the output for usage percentages and get predictions
-echo "$OUTPUT" | $PYTHON_BIN -c '
+# Pass both outputs with a separator
+(echo "$OUTPUT"; echo "===ACCOUNT_INFO==="; echo "$ACCOUNT_OUTPUT") | $PYTHON_BIN -c '
 import sys
 import re
 import os
@@ -62,7 +72,20 @@ import os
 script_dir = os.environ.get("SCRIPT_DIR", ".")
 sys.path.insert(0, script_dir)
 
-text = sys.stdin.read()
+full_text = sys.stdin.read()
+
+# Split usage and account info
+parts = full_text.split("===ACCOUNT_INFO===")
+text = parts[0] if parts else full_text
+account_text = parts[1] if len(parts) > 1 else ""
+
+# Find account/email from account info
+account_match = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", account_text)
+account_email = account_match.group(1) if account_match else None
+
+# Also try to find plan type (Max, Pro, etc.)
+plan_match = re.search(r"(Max|Pro|Team|Enterprise|Free)", account_text, re.IGNORECASE)
+plan_type = plan_match.group(1) if plan_match else None
 
 # Find session usage
 session_match = re.search(r"Current session.*?(\d+)%\s*used", text, re.DOTALL)
@@ -107,6 +130,12 @@ print(f"SONNET_USED={sonnet_out}")
 if extra_pct:
     print(f"EXTRA_USED={extra_pct}")
 
+# Output account info
+if account_email:
+    print(f"ACCOUNT_EMAIL={account_email}")
+if plan_type:
+    print(f"PLAN_TYPE={plan_type}")
+
 # Try to get predictions from neural process
 time_remaining = None
 time_remaining_str = "??"
@@ -143,6 +172,8 @@ if session_used is not None:
         print(f"PREDICTION_ERROR={str(e)[:50]}")
 
 # Human readable output
+if account_email:
+    print(f"Account: {account_email}")
 print(f"Session: {session_remaining}% remaining", end="")
 if time_remaining_str != "??":
     print(f" (~{time_remaining_str})")

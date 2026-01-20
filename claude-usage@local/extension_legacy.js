@@ -17,6 +17,7 @@ const REFRESH_INTERVAL_SECONDS = 300;
 let indicator = null;
 let timeout = null;
 let panelLabel = null;
+let accountMenuItem = null;
 let sessionMenuItem = null;
 let timeRemainingMenuItem = null;
 let weeklyMenuItem = null;
@@ -34,6 +35,12 @@ function enable() {
         y_align: Clutter.ActorAlign.CENTER
     });
     indicator.add_child(panelLabel);
+
+    accountMenuItem = new PopupMenu.PopupMenuItem('Account: --');
+    accountMenuItem.sensitive = false;
+    indicator.menu.addMenuItem(accountMenuItem);
+
+    indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
     sessionMenuItem = new PopupMenu.PopupMenuItem('Session: Loading...');
     sessionMenuItem.sensitive = false;
@@ -129,12 +136,27 @@ function parseUsage(output) {
             }
         }
 
+        // Get account info
+        const accountEmail = data['ACCOUNT_EMAIL'];
+        const planType = data['PLAN_TYPE'];
+
         // Get remaining percentages (already calculated by script)
         const sessionRemaining = data['SESSION_REMAINING'] || '??';
         const weeklyRemaining = data['WEEKLY_REMAINING'] || '??';
         const extraUsed = data['EXTRA_USED'];
         const timeRemainingStr = data['TIME_REMAINING_STR'];
         const confidence = data['CONFIDENCE'];
+
+        // Update account info
+        if (accountEmail) {
+            let accountText = `Account: ${accountEmail}`;
+            if (planType) {
+                accountText += ` (${planType})`;
+            }
+            accountMenuItem.label.set_text(accountText);
+        } else {
+            accountMenuItem.label.set_text('Account: --');
+        }
 
         // Show time remaining in panel if available, otherwise show percentages
         if (timeRemainingStr) {

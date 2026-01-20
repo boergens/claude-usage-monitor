@@ -31,6 +31,12 @@ export default class ClaudeUsageExtension extends Extension {
         this._indicator.add_child(this._panelLabel);
 
         // Create menu items
+        this._accountMenuItem = new PopupMenu.PopupMenuItem('Account: --');
+        this._accountMenuItem.sensitive = false;
+        this._indicator.menu.addMenuItem(this._accountMenuItem);
+
+        this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
         this._sessionMenuItem = new PopupMenu.PopupMenuItem('Session: Loading...');
         this._sessionMenuItem.sensitive = false;
         this._indicator.menu.addMenuItem(this._sessionMenuItem);
@@ -130,6 +136,10 @@ export default class ClaudeUsageExtension extends Extension {
                 }
             }
 
+            // Get account info
+            const accountEmail = data['ACCOUNT_EMAIL'];
+            const planType = data['PLAN_TYPE'];
+
             // Get remaining percentages (already calculated by script)
             const sessionRemaining = data['SESSION_REMAINING'] || '??';
             const weeklyRemaining = data['WEEKLY_REMAINING'] || '??';
@@ -141,6 +151,17 @@ export default class ClaudeUsageExtension extends Extension {
             this._sessionUsage = `${sessionRemaining}%`;
             this._weeklyUsage = `${weeklyRemaining}%`;
             this._timeRemaining = timeRemainingStr;
+
+            // Update account info
+            if (accountEmail) {
+                let accountText = `Account: ${accountEmail}`;
+                if (planType) {
+                    accountText += ` (${planType})`;
+                }
+                this._accountMenuItem.label.set_text(accountText);
+            } else {
+                this._accountMenuItem.label.set_text('Account: --');
+            }
 
             // Show time remaining in panel if available, otherwise show percentages
             if (timeRemainingStr) {
