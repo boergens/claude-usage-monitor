@@ -14,10 +14,14 @@ const REFRESH_INTERVAL_SECONDS = 300; // 5 minutes
 export default class ClaudeUsageExtension extends Extension {
     _indicator = null;
     _timeout = null;
-    _sessionUsage = 'Loading...';
-    _weeklyUsage = 'Loading...';
-    _timeRemaining = null;
-    _lastUpdated = '';
+
+    // Cached data state
+    _lastGoodData = null;
+    _lastSuccessfulFetch = null;
+    _isStale = false;
+    _lastError = null;
+    _fetchCount = 0;
+    _status = 'Starting...';
 
     enable() {
         this._indicator = new PanelMenu.Button(0.0, 'Claude Usage', false);
@@ -65,6 +69,14 @@ export default class ClaudeUsageExtension extends Extension {
         this._lastUpdatedMenuItem.sensitive = false;
         this._indicator.menu.addMenuItem(this._lastUpdatedMenuItem);
 
+        this._statusMenuItem = new PopupMenu.PopupMenuItem('Status: Starting...');
+        this._statusMenuItem.sensitive = false;
+        this._indicator.menu.addMenuItem(this._statusMenuItem);
+
+        this._errorMenuItem = new PopupMenu.PopupMenuItem('Last error: None');
+        this._errorMenuItem.sensitive = false;
+        this._indicator.menu.addMenuItem(this._errorMenuItem);
+
         this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // Refresh button
@@ -103,8 +115,14 @@ export default class ClaudeUsageExtension extends Extension {
     }
 
     _fetchUsage() {
+        this._fetchCount++;
+        const fetchNum = this._fetchCount;
+        const startTime = new Date().toLocaleTimeString();
+
         // Update UI to show loading
         this._panelLabel.set_text('🤖 ⟳');
+        this._status = `Fetching #${fetchNum} (started ${startTime})...`;
+        this._statusMenuItem.label.set_text(`Status: ${this._status}`);
 
         // Get the extension's directory for the helper script
         const extensionDir = this.path;
@@ -119,19 +137,26 @@ export default class ClaudeUsageExtension extends Extension {
             proc.communicate_utf8_async(null, null, (proc, res) => {
                 try {
                     const [, stdout, stderr] = proc.communicate_utf8_finish(res);
-                    this._parseUsage(stdout);
+                    const exitStatus = proc.get_exit_status();
+
+                    if (exitStatus !== 0) {
+                        this._setError(`Script exit ${exitStatus}: ${stderr.slice(0, 50)}`);
+                        return;
+                    }
+
+                    this._parseUsage(stdout, fetchNum);
                 } catch (e) {
                     log(`Claude Usage Extension: Error reading output: ${e.message}`);
-                    this._setError('Error');
+                    this._setError(`Read error: ${e.message.slice(0, 30)}`);
                 }
             });
         } catch (e) {
             log(`Claude Usage Extension: Error spawning process: ${e.message}`);
-            this._setError('Error');
+            this._setError(`Spawn error: ${e.message.slice(0, 30)}`);
         }
     }
 
-    _parseUsage(output) {
+    _parseUsage(output, fetchNum) {
         try {
             // Parse key=value format from fetch_usage.sh
             const lines = output.split('\n');
@@ -144,95 +169,129 @@ export default class ClaudeUsageExtension extends Extension {
                 }
             }
 
-            // Get account info
-            const accountEmail = data['ACCOUNT_EMAIL'];
-            const planType = data['PLAN_TYPE'];
+            const sessionRemaining = data['SESSION_REMAINING'];
+            const weeklyRemaining = data['WEEKLY_REMAINING'];
 
-            // Get remaining percentages (already calculated by script)
-            const sessionRemaining = data['SESSION_REMAINING'] || '??';
-            const weeklyRemaining = data['WEEKLY_REMAINING'] || '??';
-            const extraUsed = data['EXTRA_USED'];
-            const timeRemainingStr = data['TIME_REMAINING_STR'];
-            const confidence = data['CONFIDENCE'];
-            const sessionResets = data['SESSION_RESETS'];
-            const weeklyResets = data['WEEKLY_RESETS'];
-            const exhaustsBeforeReset = data['EXHAUSTS_BEFORE_RESET'] === 'true';
+            // Check if we got valid data
+            const hasValidData = sessionRemaining && sessionRemaining !== '??' &&
+                                 weeklyRemaining && weeklyRemaining !== '??';
 
-            // Update UI
-            this._sessionUsage = `${sessionRemaining}%`;
-            this._weeklyUsage = `${weeklyRemaining}%`;
-            this._timeRemaining = timeRemainingStr;
-
-            // Update account info
-            if (accountEmail) {
-                let accountText = `Account: ${accountEmail}`;
-                if (planType) {
-                    accountText += ` (${planType})`;
-                }
-                this._accountMenuItem.label.set_text(accountText);
+            if (hasValidData) {
+                // Cache the good data
+                this._lastGoodData = data;
+                this._lastSuccessfulFetch = new Date();
+                this._isStale = false;
+                this._lastError = null;
+                this._status = `OK (fetch #${fetchNum}) @ ${new Date().toLocaleTimeString()}`;
+                this._statusMenuItem.label.set_text(`Status: ${this._status}`);
+                this._errorMenuItem.label.set_text('Last error: None');
+                this._updateUIFromData(data);
             } else {
-                this._accountMenuItem.label.set_text('Account: --');
+                this._setError(`Got ?? values (parsed ${Object.keys(data).length} keys)`);
             }
-
-            // Show time remaining in panel if available, otherwise show percentages
-            // Add warning indicator if will exhaust before reset
-            const warning = exhaustsBeforeReset ? '⚠️ ' : '';
-            if (timeRemainingStr) {
-                this._panelLabel.set_text(`${warning}🤖 ${timeRemainingStr} (${sessionRemaining}%)`);
-            } else {
-                this._panelLabel.set_text(`🤖 W:${weeklyRemaining}% S:${sessionRemaining}%`);
-            }
-
-            this._sessionMenuItem.label.set_text(`Session remaining: ${sessionRemaining}%`);
-
-            // Show predicted time remaining
-            if (timeRemainingStr) {
-                let timeText = `Predicted time left: ~${timeRemainingStr}`;
-                if (confidence) {
-                    const conf = Math.round(parseFloat(confidence) * 100);
-                    timeText += ` (${conf}% conf)`;
-                }
-                if (exhaustsBeforeReset) {
-                    timeText += ' ⚠️ before reset!';
-                }
-                this._timeRemainingMenuItem.label.set_text(timeText);
-            } else {
-                this._timeRemainingMenuItem.label.set_text('Predicted time left: --');
-            }
-
-            // Session reset time
-            if (sessionResets) {
-                this._sessionResetsMenuItem.label.set_text(`Resets at ${sessionResets}`);
-            } else {
-                this._sessionResetsMenuItem.label.set_text('Resets: --');
-            }
-
-            this._weeklyMenuItem.label.set_text(`Weekly remaining: ${weeklyRemaining}%`);
-
-            if (extraUsed) {
-                this._weeklyMenuItem.label.set_text(`Weekly remaining: ${weeklyRemaining}% (Extra: ${extraUsed}% used)`);
-            }
-
-            // Weekly reset time
-            if (weeklyResets) {
-                this._weeklyResetsMenuItem.label.set_text(`Resets ${weeklyResets}`);
-            } else {
-                this._weeklyResetsMenuItem.label.set_text('Resets: --');
-            }
-
-            const now = new Date();
-            this._lastUpdated = now.toLocaleTimeString();
-            this._lastUpdatedMenuItem.label.set_text(`Last updated: ${this._lastUpdated}`);
 
         } catch (e) {
             log(`Claude Usage Extension: Error parsing usage: ${e.message}`);
-            this._setError('Parse error');
+            this._setError(`Parse error: ${e.message.slice(0, 30)}`);
+        }
+    }
+
+    _updateUIFromData(data) {
+        const accountEmail = data['ACCOUNT_EMAIL'];
+        const planType = data['PLAN_TYPE'];
+        const sessionRemaining = data['SESSION_REMAINING'] || '??';
+        const weeklyRemaining = data['WEEKLY_REMAINING'] || '??';
+        const extraUsed = data['EXTRA_USED'];
+        const timeRemainingStr = data['TIME_REMAINING_STR'];
+        const confidence = data['CONFIDENCE'];
+        const sessionResets = data['SESSION_RESETS'];
+        const weeklyResets = data['WEEKLY_RESETS'];
+        const exhaustsBeforeReset = data['EXHAUSTS_BEFORE_RESET'] === 'true';
+
+        // Determine robot emoji
+        const robot = this._isStale ? '😴' : '🤖';
+        const warning = exhaustsBeforeReset ? '⚠️ ' : '';
+
+        // Update panel label
+        if (timeRemainingStr) {
+            this._panelLabel.set_text(`${warning}${robot} ${timeRemainingStr} (${sessionRemaining}%)`);
+        } else {
+            this._panelLabel.set_text(`${robot} W:${weeklyRemaining}% S:${sessionRemaining}%`);
+        }
+
+        // Update account info
+        if (accountEmail) {
+            let accountText = `Account: ${accountEmail}`;
+            if (planType) {
+                accountText += ` (${planType})`;
+            }
+            this._accountMenuItem.label.set_text(accountText);
+        } else {
+            this._accountMenuItem.label.set_text('Account: --');
+        }
+
+        // Session info
+        const staleSuffix = this._isStale ? ' (stale)' : '';
+        this._sessionMenuItem.label.set_text(`Session remaining: ${sessionRemaining}%${staleSuffix}`);
+
+        // Time remaining
+        if (timeRemainingStr) {
+            let timeText = `Depletes in ~${timeRemainingStr}`;
+            if (confidence) {
+                const conf = Math.round(parseFloat(confidence) * 100);
+                timeText += ` (${conf}% conf)`;
+            }
+            if (exhaustsBeforeReset) {
+                timeText += ' ⚠️ before reset!';
+            }
+            this._timeRemainingMenuItem.label.set_text(timeText);
+        } else {
+            this._timeRemainingMenuItem.label.set_text('Depletes: --');
+        }
+
+        // Session reset time
+        if (sessionResets) {
+            this._sessionResetsMenuItem.label.set_text(`Resets at ${sessionResets}`);
+        } else {
+            this._sessionResetsMenuItem.label.set_text('Resets: --');
+        }
+
+        // Weekly info
+        let weeklyText = `Weekly remaining: ${weeklyRemaining}%`;
+        if (extraUsed) {
+            weeklyText += ` (Extra: ${extraUsed}% used)`;
+        }
+        this._weeklyMenuItem.label.set_text(weeklyText);
+
+        // Weekly reset time
+        if (weeklyResets) {
+            this._weeklyResetsMenuItem.label.set_text(`Resets ${weeklyResets}`);
+        } else {
+            this._weeklyResetsMenuItem.label.set_text('Resets: --');
+        }
+
+        // Last updated
+        if (this._lastSuccessfulFetch) {
+            const suffix = this._isStale ? ' (stale)' : '';
+            this._lastUpdatedMenuItem.label.set_text(`Last updated: ${this._lastSuccessfulFetch.toLocaleTimeString()}${suffix}`);
         }
     }
 
     _setError(msg) {
-        this._panelLabel.set_text(`🤖 ${msg}`);
-        this._sessionMenuItem.label.set_text(`Session: ${msg}`);
-        this._weeklyMenuItem.label.set_text(`Weekly: ${msg}`);
+        this._lastError = msg;
+        this._isStale = true;
+        this._status = `Error @ ${new Date().toLocaleTimeString()}`;
+
+        this._statusMenuItem.label.set_text(`Status: ${this._status}`);
+        this._errorMenuItem.label.set_text(`Last error: ${msg}`);
+
+        // Use cached data if available, otherwise show error state
+        if (this._lastGoodData) {
+            this._updateUIFromData(this._lastGoodData);
+        } else {
+            this._panelLabel.set_text('😴 --');
+            this._sessionMenuItem.label.set_text('Session: Waiting for data...');
+            this._weeklyMenuItem.label.set_text('Weekly: Waiting for data...');
+        }
     }
 }

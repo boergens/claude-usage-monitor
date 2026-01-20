@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
 Claude Usage Menu Bar - macOS status bar utility
-Shows Claude Code usage (session and weekly remaining) with AI-powered predictions.
+Shows Claude Code usage with AI-powered predictions.
 """
 
-import subprocess
-import os
 import sys
-import re
-import threading
-import time
 from pathlib import Path
 
 # Hide dock icon before importing rumps
@@ -17,300 +12,165 @@ try:
     from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 except ImportError:
-    pass  # AppKit not available, dock icon will show
+    pass
 
 import rumps
 
-# Add parent directory to path for neural_process import
+# Add parent directory to path for shared modules
 SCRIPT_DIR = Path(__file__).parent.parent / "claude-usage@local"
 sys.path.insert(0, str(SCRIPT_DIR))
+
+from usage_fetcher import UsageFetcher, get_display_values
 
 REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
 
 
 class ClaudeUsageApp(rumps.App):
     def __init__(self):
-        super().__init__(
-            "Claude Usage",
-            icon=None,
-            title="🤖 --",
-            quit_button=None
-        )
-
-        # Cache for last known good values
-        self.last_good_data = None
-        self.last_successful_fetch = None
-        self.is_stale = False
+        super().__init__("Claude Usage", icon=None, title="🤖 --", quit_button=None)
 
         # Menu items
-        self.account_item = rumps.MenuItem("Account: --", callback=None)
-        self.account_item.set_callback(None)
-
-        self.session_item = rumps.MenuItem("Session: Loading...", callback=None)
-        self.session_item.set_callback(None)
-
-        self.time_remaining_item = rumps.MenuItem("Depletes: --", callback=None)
-        self.time_remaining_item.set_callback(None)
-
-        self.session_resets_item = rumps.MenuItem("Resets: --", callback=None)
-        self.session_resets_item.set_callback(None)
-
-        self.weekly_item = rumps.MenuItem("Weekly: Loading...", callback=None)
-        self.weekly_item.set_callback(None)
-
-        self.weekly_resets_item = rumps.MenuItem("Resets: --", callback=None)
-        self.weekly_resets_item.set_callback(None)
-
-        self.last_updated_item = rumps.MenuItem("Last updated: Never", callback=None)
-        self.last_updated_item.set_callback(None)
-
-        self.debug_item = rumps.MenuItem("Debug: --", callback=None)
-        self.debug_item.set_callback(None)
-
-        self.status_item = rumps.MenuItem("Status: Starting...", callback=None)
-        self.status_item.set_callback(None)
+        self.account_item = rumps.MenuItem("Account: --")
+        self.session_item = rumps.MenuItem("Session: Loading...")
+        self.time_remaining_item = rumps.MenuItem("Depletes: --")
+        self.session_resets_item = rumps.MenuItem("Resets: --")
+        self.weekly_item = rumps.MenuItem("Weekly: Loading...")
+        self.weekly_resets_item = rumps.MenuItem("Resets: --")
+        self.last_updated_item = rumps.MenuItem("Last updated: Never")
+        self.status_item = rumps.MenuItem("Status: Starting...")
+        self.error_item = rumps.MenuItem("Last error: None")
 
         self.menu = [
             self.account_item,
-            None,  # Separator
+            None,
             self.session_item,
             self.time_remaining_item,
             self.session_resets_item,
-            None,  # Separator
+            None,
             self.weekly_item,
             self.weekly_resets_item,
-            None,  # Separator
+            None,
             self.last_updated_item,
             self.status_item,
-            self.debug_item,
-            None,  # Separator
+            self.error_item,
+            None,
             rumps.MenuItem("Refresh Now", callback=self.refresh_clicked),
-            None,  # Separator
+            None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
 
-        # Start refresh timer
+        # Set up shared fetcher
+        self.fetcher = UsageFetcher(on_update=self._on_fetcher_update)
+        self.fetcher.set_main_thread_scheduler(self._run_on_main_thread)
+
+        # Start refresh timer and initial fetch
         self.timer = rumps.Timer(self.refresh_timer, REFRESH_INTERVAL_SECONDS)
         self.timer.start()
+        self.fetcher.fetch_async()
 
-        # Initial fetch (in background)
-        threading.Thread(target=self.fetch_usage, daemon=True).start()
-
-    def refresh_clicked(self, _):
-        """Manual refresh button clicked."""
-        threading.Thread(target=self.fetch_usage, daemon=True).start()
-
-    def refresh_timer(self, _):
-        """Periodic refresh timer."""
-        threading.Thread(target=self.fetch_usage, daemon=True).start()
-
-    def _update_on_main_thread(self, func, *args, **kwargs):
-        """Schedule a function to run on the main thread for UI updates."""
+    def _run_on_main_thread(self, func, *args, **kwargs):
+        """Schedule function on main thread for UI updates."""
         try:
             from PyObjCTools import AppHelper
             AppHelper.callAfter(func, *args, **kwargs)
         except ImportError:
-            func(*args, **kwargs)  # Fallback: run directly
+            func(*args, **kwargs)
 
-    def _set_loading_state(self, start_time):
-        """Set loading state in UI (called on main thread)."""
-        self.title = "🤖 ⟳"
-        self.status_item.title = f"Status: Fetching (started {start_time})..."
-        self.debug_item.title = "Debug: Running fetch_usage.sh"
+    def refresh_clicked(self, _):
+        self.fetcher.fetch_async()
 
-    def _set_parsing_state(self):
-        """Set parsing state in UI (called on main thread)."""
-        self.status_item.title = "Status: Parsing output..."
+    def refresh_timer(self, _):
+        self.fetcher.fetch_async()
 
-    def _set_ok_state(self, timestamp):
-        """Set OK state in UI (called on main thread)."""
-        self.status_item.title = f"Status: OK @ {timestamp}"
+    def _on_fetcher_update(self, state):
+        """Called when fetcher state changes (on main thread)."""
+        data = state['data']
+        is_stale = state['is_stale']
+        error = state['error']
+        status = state['status']
+        is_fetching = state['is_fetching']
+        last_successful = state['last_successful_fetch']
 
-    def _set_error_state(self, debug_msg, status_msg, error_msg):
-        """Set error state in UI (called on main thread)."""
-        self.debug_item.title = debug_msg
-        self.status_item.title = status_msg
-        self.set_error(error_msg)
+        # Update status
+        if is_fetching:
+            self.title = "🤖 ⟳"
+        self.status_item.title = f"Status: {status}"
 
-    def fetch_usage(self):
-        """Fetch Claude usage by calling fetch_usage.sh script."""
-        from datetime import datetime
-
-        # Show loading state (on main thread)
-        start_time = datetime.now().strftime('%H:%M:%S')
-        self._update_on_main_thread(self._set_loading_state, start_time)
-
-        try:
-            # Call the fetch_usage.sh script directly
-            script_path = SCRIPT_DIR / "fetch_usage.sh"
-
-            result = subprocess.run(
-                ["bash", str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                cwd=str(SCRIPT_DIR)
-            )
-
-            if result.returncode != 0:
-                stderr_preview = result.stderr[:100].replace('\n', ' ') if result.stderr else "no stderr"
-                self._update_on_main_thread(
-                    self._set_error_state,
-                    f"Debug: exit={result.returncode} {stderr_preview}",
-                    f"Status: Error @ {datetime.now().strftime('%H:%M:%S')}",
-                    f"Script exit {result.returncode}"
-                )
-                return
-
-            # Parse the key=value output from the script
-            self._update_on_main_thread(self._set_parsing_state)
-            self._update_on_main_thread(self.parse_script_output, result.stdout)
-            self._update_on_main_thread(self._set_ok_state, datetime.now().strftime('%H:%M:%S'))
-
-        except subprocess.TimeoutExpired:
-            self._update_on_main_thread(
-                self._set_error_state,
-                "Debug: Timeout after 90s",
-                f"Status: Timeout @ {datetime.now().strftime('%H:%M:%S')}",
-                "Timeout (90s)"
-            )
-        except Exception as e:
-            self._update_on_main_thread(
-                self._set_error_state,
-                f"Debug: {type(e).__name__}: {str(e)[:40]}",
-                f"Status: Error @ {datetime.now().strftime('%H:%M:%S')}",
-                str(e)[:20]
-            )
-
-    def parse_script_output(self, output):
-        """Parse key=value output from fetch_usage.sh and update UI."""
-        from datetime import datetime
-
-        try:
-            # Parse key=value lines
-            data = {}
-            for line in output.strip().split('\n'):
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    data[key.strip()] = value.strip()
-
-            # Extract values
-            session_remaining = data.get('SESSION_REMAINING', '??')
-            weekly_remaining = data.get('WEEKLY_REMAINING', '??')
-
-            # Check if we got valid data (not "??")
-            has_valid_data = session_remaining != '??' and weekly_remaining != '??'
-
-            if has_valid_data:
-                # Cache the good data
-                self.last_good_data = data.copy()
-                self.last_successful_fetch = datetime.now()
-                self.is_stale = False
-                self._update_ui_from_data(data)
-            else:
-                # Data is bad - use cached data with stale indicator
-                self.debug_item.title = f"Debug: Got ??, using cached"
-                self._show_stale_data()
-
-        except Exception as e:
-            self.debug_item.title = f"Debug: Parse error - {str(e)[:30]}"
-            self._show_stale_data()
-
-    def _update_ui_from_data(self, data):
-        """Update UI from data dict (either fresh or cached)."""
-        from datetime import datetime
-
-        account_email = data.get('ACCOUNT_EMAIL')
-        plan_type = data.get('PLAN_TYPE')
-        session_remaining = data.get('SESSION_REMAINING', '??')
-        weekly_remaining = data.get('WEEKLY_REMAINING', '??')
-        extra_pct = data.get('EXTRA_USED')
-        time_remaining_str = data.get('TIME_REMAINING_STR')
-        confidence = data.get('CONFIDENCE')
-        session_resets = data.get('SESSION_RESETS')
-        weekly_resets = data.get('WEEKLY_RESETS')
-        exhausts_before_reset = data.get('EXHAUSTS_BEFORE_RESET') == 'true'
-
-        # Determine which robot emoji to use
-        robot = "😴" if self.is_stale else "🤖"
-
-        # Update debug - show exhaustion status
-        exhaust_str = "WARN" if exhausts_before_reset else "ok"
-        stale_str = " STALE" if self.is_stale else ""
-        self.debug_item.title = f"Debug: OK ({len(data)} vals, {exhaust_str}{stale_str})"
-
-        # Update UI - show warning if will exhaust before reset
-        warning = "⚠️ " if exhausts_before_reset else ""
-        if time_remaining_str and time_remaining_str != '??':
-            self.title = f"{warning}{robot} {time_remaining_str} ({session_remaining}%)"
+        # Update error display
+        if error:
+            self.error_item.title = f"Last error: {error}"
         else:
-            self.title = f"{robot} W:{weekly_remaining}% S:{session_remaining}%"
+            self.error_item.title = "Last error: None"
 
-        # Update account info
-        if account_email:
-            account_text = f"Account: {account_email}"
-            if plan_type:
-                account_text += f" ({plan_type})"
+        # Update data display
+        if data:
+            self._update_ui_from_data(data, is_stale)
+        elif not is_fetching:
+            # No data and not fetching - show waiting state
+            robot = "😴"
+            self.title = f"{robot} --"
+            self.session_item.title = "Session: Waiting for data..."
+            self.weekly_item.title = "Weekly: Waiting for data..."
+
+        # Update last updated time
+        if last_successful:
+            suffix = " (stale)" if is_stale else ""
+            self.last_updated_item.title = f"Last updated: {last_successful.strftime('%H:%M:%S')}{suffix}"
+
+    def _update_ui_from_data(self, data, is_stale):
+        """Update UI from fetched data."""
+        v = get_display_values(data)
+
+        robot = "😴" if is_stale else "🤖"
+        warning = "⚠️ " if v['exhausts_before_reset'] else ""
+
+        # Title
+        if v['time_remaining_str']:
+            self.title = f"{warning}{robot} {v['time_remaining_str']} ({v['session_remaining']}%)"
+        else:
+            self.title = f"{robot} W:{v['weekly_remaining']}% S:{v['session_remaining']}%"
+
+        # Account
+        if v['account_email']:
+            account_text = f"Account: {v['account_email']}"
+            if v['plan_type']:
+                account_text += f" ({v['plan_type']})"
             self.account_item.title = account_text
         else:
             self.account_item.title = "Account: --"
 
-        self.session_item.title = f"Session remaining: {session_remaining}%"
+        # Session
+        self.session_item.title = f"Session remaining: {v['session_remaining']}%"
 
-        if time_remaining_str and time_remaining_str != '??':
-            time_text = f"Depletes in ~{time_remaining_str}"
-            if confidence:
+        if v['time_remaining_str']:
+            time_text = f"Depletes in ~{v['time_remaining_str']}"
+            if v['confidence']:
                 try:
-                    conf = round(float(confidence) * 100)
+                    conf = round(float(v['confidence']) * 100)
                     time_text += f" ({conf}% conf)"
                 except:
                     pass
-            if exhausts_before_reset:
+            if v['exhausts_before_reset']:
                 time_text += " ⚠️ before reset!"
             self.time_remaining_item.title = time_text
         else:
             self.time_remaining_item.title = "Depletes: --"
 
-        # Session reset time (from Claude)
-        if session_resets:
-            reset_text = f"Resets at {session_resets}"
-            self.session_resets_item.title = reset_text
+        if v['session_resets']:
+            self.session_resets_item.title = f"Resets at {v['session_resets']}"
         else:
             self.session_resets_item.title = "Resets: --"
 
-        weekly_text = f"Weekly remaining: {weekly_remaining}%"
-        if extra_pct:
-            weekly_text += f" (Extra: {extra_pct}% used)"
+        # Weekly
+        weekly_text = f"Weekly remaining: {v['weekly_remaining']}%"
+        if v['extra_pct']:
+            weekly_text += f" (Extra: {v['extra_pct']}% used)"
         self.weekly_item.title = weekly_text
 
-        # Weekly reset time (from Claude)
-        if weekly_resets:
-            self.weekly_resets_item.title = f"Resets {weekly_resets}"
+        if v['weekly_resets']:
+            self.weekly_resets_item.title = f"Resets {v['weekly_resets']}"
         else:
             self.weekly_resets_item.title = "Resets: --"
-
-        # Show when data was last successfully fetched
-        if self.is_stale and self.last_successful_fetch:
-            self.last_updated_item.title = f"Last updated: {self.last_successful_fetch.strftime('%H:%M:%S')} (stale)"
-        else:
-            self.last_updated_item.title = f"Last updated: {datetime.now().strftime('%H:%M:%S')}"
-
-    def _show_stale_data(self):
-        """Show cached data with stale indicator, or error if no cache."""
-        if self.last_good_data:
-            self.is_stale = True
-            self._update_ui_from_data(self.last_good_data)
-        else:
-            # No cached data yet
-            self.title = "😴 --"
-            self.session_item.title = "Session: Waiting for data..."
-            self.weekly_item.title = "Weekly: Waiting for data..."
-
-    def set_error(self, msg):
-        """Set error state in UI - use cached data with stale indicator if available."""
-        from datetime import datetime
-        self.debug_item.title = f"Debug: {msg} @ {datetime.now().strftime('%H:%M:%S')}"
-        self._show_stale_data()
 
 
 if __name__ == "__main__":

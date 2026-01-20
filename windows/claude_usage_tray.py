@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 Claude Usage System Tray - Windows taskbar utility
-Shows Claude Code usage (session and weekly remaining) with AI-powered predictions.
+Shows Claude Code usage with AI-powered predictions.
 """
 
-import subprocess
-import os
 import sys
-import threading
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -19,9 +17,11 @@ except ImportError:
     print("Please install required packages: pip install pystray pillow")
     sys.exit(1)
 
-# Add parent directory to path for neural_process import
+# Add parent directory to path for shared modules
 SCRIPT_DIR = Path(__file__).parent.parent / "claude-usage@local"
 sys.path.insert(0, str(SCRIPT_DIR))
+
+from usage_fetcher import UsageFetcher, get_display_values
 
 REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
 
@@ -37,7 +37,6 @@ def create_icon_image(text="🤖", bg_color="#4A90D9"):
 
     # Try to draw text (fallback to simple shapes if font fails)
     try:
-        # Try to use a system font
         font = ImageFont.truetype("arial.ttf", 24)
         bbox = draw.textbbox((0, 0), text[:2], font=font)
         text_width = bbox[2] - bbox[0]
@@ -56,18 +55,14 @@ def create_icon_image(text="🤖", bg_color="#4A90D9"):
 
 class ClaudeUsageTray:
     def __init__(self):
-        self.account_email = None
-        self.plan_type = None
-        self.session_remaining = "??"
-        self.weekly_remaining = "??"
-        self.time_remaining_str = None
-        self.confidence = None
-        self.session_resets = None
-        self.weekly_resets = None
-        self.exhausts_before_reset = False
-        self.last_updated = "Never"
-        self.debug_status = "Starting..."
         self.running = True
+
+        # Display state (updated from fetcher)
+        self.data = None
+        self.is_stale = False
+        self.status = "Starting..."
+        self.error = None
+        self.last_successful = None
 
         # Create initial icon
         self.icon = pystray.Icon(
@@ -77,181 +72,142 @@ class ClaudeUsageTray:
             menu=self.create_menu()
         )
 
+        # Set up shared fetcher
+        self.fetcher = UsageFetcher(on_update=self._on_fetcher_update)
+        # Note: pystray doesn't need main thread scheduling for menu updates
+
         # Start refresh thread
         self.refresh_thread = threading.Thread(target=self.refresh_loop, daemon=True)
         self.refresh_thread.start()
 
+    def _on_fetcher_update(self, state):
+        """Called when fetcher state changes."""
+        self.data = state['data']
+        self.is_stale = state['is_stale']
+        self.error = state['error']
+        self.status = state['status']
+        self.last_successful = state['last_successful_fetch']
+
+        # Update tooltip
+        self._update_tooltip()
+
+    def _update_tooltip(self):
+        """Update the system tray tooltip."""
+        if self.data:
+            v = get_display_values(self.data)
+            robot = "[ZZZ]" if self.is_stale else ""
+            warning = "[!] " if v['exhausts_before_reset'] else ""
+
+            if v['time_remaining_str']:
+                self.icon.title = f"{warning}{robot}Claude: {v['time_remaining_str']} ({v['session_remaining']}%)"
+            else:
+                self.icon.title = f"{robot}Claude: S:{v['session_remaining']}% W:{v['weekly_remaining']}%"
+        else:
+            self.icon.title = f"Claude Usage: {self.status}"
+
+    def _get_display_values(self):
+        """Get current display values."""
+        return get_display_values(self.data)
+
     def get_account_text(self):
-        if self.account_email:
-            text = f"Account: {self.account_email}"
-            if self.plan_type:
-                text += f" ({self.plan_type})"
+        v = self._get_display_values()
+        if v['account_email']:
+            text = f"Account: {v['account_email']}"
+            if v['plan_type']:
+                text += f" ({v['plan_type']})"
             return text
         return "Account: --"
 
+    def get_session_text(self):
+        v = self._get_display_values()
+        stale = " (stale)" if self.is_stale else ""
+        return f"Session: {v['session_remaining']}% remaining{stale}"
+
     def get_time_remaining_text(self):
-        if self.time_remaining_str and self.time_remaining_str != "??":
-            text = f"Depletes in ~{self.time_remaining_str}"
-            if self.confidence:
+        v = self._get_display_values()
+        if v['time_remaining_str']:
+            text = f"Depletes in ~{v['time_remaining_str']}"
+            if v['confidence']:
                 try:
-                    conf = round(float(self.confidence) * 100)
+                    conf = round(float(v['confidence']) * 100)
                     text += f" ({conf}% conf)"
                 except:
                     pass
-            if self.exhausts_before_reset:
+            if v['exhausts_before_reset']:
                 text += " - before reset!"
             return text
         return "Depletes: --"
 
     def get_session_resets_text(self):
-        if self.session_resets:
-            return f"Resets at {self.session_resets}"
+        v = self._get_display_values()
+        if v['session_resets']:
+            return f"Resets at {v['session_resets']}"
         return "Resets: --"
 
+    def get_weekly_text(self):
+        v = self._get_display_values()
+        text = f"Weekly: {v['weekly_remaining']}% remaining"
+        if v['extra_pct']:
+            text += f" (Extra: {v['extra_pct']}% used)"
+        return text
+
     def get_weekly_resets_text(self):
-        if self.weekly_resets:
-            return f"Resets {self.weekly_resets}"
+        v = self._get_display_values()
+        if v['weekly_resets']:
+            return f"Resets {v['weekly_resets']}"
         return "Resets: --"
+
+    def get_last_updated_text(self):
+        if self.last_successful:
+            suffix = " (stale)" if self.is_stale else ""
+            return f"Updated: {self.last_successful.strftime('%H:%M:%S')}{suffix}"
+        return "Updated: Never"
+
+    def get_status_text(self):
+        return f"Status: {self.status}"
+
+    def get_error_text(self):
+        if self.error:
+            return f"Last error: {self.error}"
+        return "Last error: None"
 
     def create_menu(self):
         return pystray.Menu(
-            pystray.MenuItem(
-                lambda item: self.get_account_text(),
-                None,
-                enabled=False
-            ),
+            pystray.MenuItem(lambda item: self.get_account_text(), None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                lambda item: f"Session: {self.session_remaining}% remaining",
-                None,
-                enabled=False
-            ),
-            pystray.MenuItem(
-                lambda item: self.get_time_remaining_text(),
-                None,
-                enabled=False
-            ),
-            pystray.MenuItem(
-                lambda item: self.get_session_resets_text(),
-                None,
-                enabled=False
-            ),
+            pystray.MenuItem(lambda item: self.get_session_text(), None, enabled=False),
+            pystray.MenuItem(lambda item: self.get_time_remaining_text(), None, enabled=False),
+            pystray.MenuItem(lambda item: self.get_session_resets_text(), None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                lambda item: f"Weekly: {self.weekly_remaining}% remaining",
-                None,
-                enabled=False
-            ),
-            pystray.MenuItem(
-                lambda item: self.get_weekly_resets_text(),
-                None,
-                enabled=False
-            ),
+            pystray.MenuItem(lambda item: self.get_weekly_text(), None, enabled=False),
+            pystray.MenuItem(lambda item: self.get_weekly_resets_text(), None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                lambda item: f"Updated: {self.last_updated}",
-                None,
-                enabled=False
-            ),
-            pystray.MenuItem(
-                lambda item: f"Debug: {self.debug_status}",
-                None,
-                enabled=False
-            ),
+            pystray.MenuItem(lambda item: self.get_last_updated_text(), None, enabled=False),
+            pystray.MenuItem(lambda item: self.get_status_text(), None, enabled=False),
+            pystray.MenuItem(lambda item: self.get_error_text(), None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Refresh Now", self.refresh_clicked),
             pystray.MenuItem("Quit", self.quit_clicked),
         )
 
     def refresh_clicked(self, icon, item):
-        threading.Thread(target=self.fetch_usage, daemon=True).start()
+        self.fetcher.fetch_async()
 
     def quit_clicked(self, icon, item):
         self.running = False
         icon.stop()
 
     def refresh_loop(self):
+        # Initial fetch
+        self.fetcher.fetch_async()
+
         while self.running:
-            self.fetch_usage()
             for _ in range(REFRESH_INTERVAL_SECONDS):
                 if not self.running:
                     break
                 time.sleep(1)
-
-    def fetch_usage(self):
-        """Fetch Claude usage by calling fetch_usage.sh script."""
-        self.update_tooltip("Claude Usage: Refreshing...")
-        self.debug_status = "Fetching..."
-
-        fetch_script = SCRIPT_DIR / "fetch_usage.sh"
-
-        if not fetch_script.exists():
-            self.debug_status = f"Script not found: {fetch_script}"
-            self.update_tooltip("Claude Usage: Script not found")
-            return
-
-        try:
-            # Try bash (Git Bash, WSL, or native)
-            result = subprocess.run(
-                ["bash", str(fetch_script)],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                cwd=str(SCRIPT_DIR)
-            )
-
-            if result.returncode != 0:
-                self.debug_status = f"Script error: {result.stderr[:40]}"
-                self.update_tooltip("Claude Usage: Script error")
-                return
-
-            self.parse_script_output(result.stdout)
-
-        except FileNotFoundError:
-            self.debug_status = "bash not found - install Git Bash or WSL"
-            self.update_tooltip("Claude Usage: Install bash")
-        except subprocess.TimeoutExpired:
-            self.debug_status = "Timeout (90s)"
-            self.update_tooltip("Claude Usage: Timeout")
-        except Exception as e:
-            self.debug_status = f"Error: {str(e)[:40]}"
-            self.update_tooltip("Claude Usage: Error")
-
-    def parse_script_output(self, output):
-        """Parse key=value output from fetch_usage.sh."""
-        try:
-            data = {}
-            for line in output.strip().split('\n'):
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    data[key.strip()] = value.strip()
-
-            self.account_email = data.get('ACCOUNT_EMAIL')
-            self.plan_type = data.get('PLAN_TYPE')
-            self.session_remaining = data.get('SESSION_REMAINING', '??')
-            self.weekly_remaining = data.get('WEEKLY_REMAINING', '??')
-            self.time_remaining_str = data.get('TIME_REMAINING_STR')
-            self.confidence = data.get('CONFIDENCE')
-            self.session_resets = data.get('SESSION_RESETS')
-            self.weekly_resets = data.get('WEEKLY_RESETS')
-            self.exhausts_before_reset = data.get('EXHAUSTS_BEFORE_RESET') == 'true'
-            self.last_updated = datetime.now().strftime('%H:%M:%S')
-            self.debug_status = f"OK ({len(data)} values)"
-
-            # Update tooltip - show warning if will exhaust before reset
-            warning = "[!] " if self.exhausts_before_reset else ""
-            if self.time_remaining_str and self.time_remaining_str != "??":
-                self.update_tooltip(f"{warning}Claude: {self.time_remaining_str} ({self.session_remaining}%)")
-            else:
-                self.update_tooltip(f"Claude: S:{self.session_remaining}% W:{self.weekly_remaining}%")
-
-        except Exception as e:
-            self.debug_status = f"Parse error: {str(e)[:30]}"
-            self.update_tooltip("Claude Usage: Parse error")
-
-    def update_tooltip(self, text):
-        """Update the system tray tooltip."""
-        self.icon.title = text
+            if self.running:
+                self.fetcher.fetch_async()
 
     def run(self):
         """Run the system tray app."""
